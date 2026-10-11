@@ -1,0 +1,4 @@
+# Dependencies for ClearScreenAI signal-only validation scripts (Python >= 3.11)
+# Note: scripts/audit_dataset.py uses only the Python standard library.
+# scripts/evaluate_baselines.py uses rapidfuzz for transparent string matching.
+rapidfuzz>=3.0.0

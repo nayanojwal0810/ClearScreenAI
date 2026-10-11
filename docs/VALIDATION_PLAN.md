@@ -92,8 +92,23 @@ The numerical uplift target is a decision gate for this project, not an expected
 - No API keys, paid API calls, full-size LLMs, hyperparameter sweeps, frontend, API, Docker or production build during signal-only validation.
 - The first Antigravity task is to create and test scripts on tiny synthetic fixtures only. It must not start a full-data run automatically. It must give exact commands for full-data audit/baselines, commit only code/docs/tests, verify that data/ is ignored and untracked, push to GitHub, then stop.
 - Full dataset audit and baseline runs must process all eligible rows. Any long neural run must be launched only after the user receives the exact command and explicitly runs it; inspect returned output before proceeding.
-- Store aggregate metrics and concise error examples only after review. Never commit source records, names, downloaded files, model weights, embeddings, API keys or generated row-level predictions.
 - No results have been run yet. Never put fabricated metrics in a report or resume.
+
+### Implementation scripts and commands (Gates 0 & 1)
+
+- **Audit script:** `scripts/audit_dataset.py` (streaming gzip JSONL, standard library only, aggregate-only output without storing raw entity content):
+  ```bash
+  python scripts/audit_dataset.py --pairs data/raw/pairs.json.gz --ofac-zip data/raw/SDN_ENHANCED.ZIP --out outputs/audit_summary.json
+  ```
+- **Baseline evaluation:** `scripts/evaluate_baselines.py` (streaming exact name, exact alias, RapidFuzz token similarity with val-only threshold tuning):
+  ```bash
+  python scripts/evaluate_baselines.py --pairs data/raw/pairs.json.gz --out outputs/baseline_summary.json
+  ```
+- **Synthetic unit tests:** `tests/test_validation_scripts.py`:
+  ```bash
+  python -m unittest tests/test_validation_scripts.py
+  ```
+- **Validation dependencies:** `requirements-validation.txt` (`rapidfuzz>=3.0.0`).
 
 ## Research references
 
