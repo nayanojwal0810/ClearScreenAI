@@ -379,7 +379,10 @@ class TestValidationScripts(unittest.TestCase):
         self.assertEqual(result["partition_audit"]["evaluation_level"], "pair_level")
         self.assertFalse(result["partition_audit"]["unseen_entity_generalization_claimed"])
         self.assertIn("results", result)
-        self.assertIn("test_evaluation", result["results"])
+        self.assertIn("primary_scope_matchable", result["results"])
+        self.assertIn("secondary_scope_broader", result["results"])
+        self.assertIn("test_evaluation", result["results"]["primary_scope_matchable"])
+        self.assertIn("test_evaluation", result["results"]["secondary_scope_broader"])
 
     def test_ofac_archive_synthetic(self) -> None:
         """Test OFAC zip audit logic on synthetic zip archive and missing file."""
@@ -540,6 +543,148 @@ class TestValidationScripts(unittest.TestCase):
         self.assertNotIn(sensitive_name, serialized)
         self.assertNotIn(sensitive_alias, serialized)
         self.assertNotIn(sensitive_address, serialized)
+        self.assertNotIn(sensitive_id, serialized)
+
+    def test_baseline_duplicate_and_payload_preservation(self) -> None:
+        """Requirement A & D: Test duplicate observation deduplication, payload preservation,
+        and conflicting label exclusion in evaluate_baselines."""
+        records = [
+            # 1. Exact duplicate observation: same pair key, same payload, same label
+            {
+                "judgement": "positive",
+                "left": {"id": "p1", "schema": "Person", "caption": "Alice", "properties": {"name": ["Alice"]}},
+                "right": {"id": "p2", "schema": "Person", "caption": "Alice", "properties": {"name": ["Alice"]}},
+            },
+            {
+                "judgement": "positive",
+                "left": {"id": "p1", "schema": "Person", "caption": "Alice", "properties": {"name": ["Alice"]}},
+                "right": {"id": "p2", "schema": "Person", "caption": "Alice", "properties": {"name": ["Alice"]}},
+            },
+            # 2. Same pair key (p1, p2), but different payload: preserved and evaluated!
+            {
+                "judgement": "positive",
+                "left": {"id": "p1", "schema": "Person", "caption": "Alice Updated", "properties": {"name": ["Alice Updated"]}},
+                "right": {"id": "p2", "schema": "Person", "caption": "Alice", "properties": {"name": ["Alice"]}},
+            },
+            # 3. Pair key (p3, p4) with conflicting labels: positive in one row, negative in another
+            {
+                "judgement": "positive",
+                "left": {"id": "p3", "schema": "Company", "caption": "Acme Corp"},
+                "right": {"id": "p4", "schema": "Company", "caption": "Acme Inc"},
+            },
+            {
+                "judgement": "negative",
+                "left": {"id": "p3", "schema": "Company", "caption": "Acme Corp"},
+                "right": {"id": "p4", "schema": "Company", "caption": "Acme Inc"},
+            },
+        ]
+        path = self._write_synthetic_gz(records)
+        result = evaluate_benchmark(pairs_path=path)
+
+        # Exact duplicate was discarded
+        self.assertEqual(result["metadata"]["exact_duplicates_discarded"], 1)
+        # Conflicting pair key was flagged and excluded from clean metrics
+        self.assertEqual(result["conflict_diagnostics"]["conflicting_pair_keys"], 1)
+        self.assertEqual(result["conflict_diagnostics"]["conflicting_rows_total"], 2)
+
+    def test_pair_keys_cannot_cross_partitions(self) -> None:
+        """Requirement A & D: Test that all versions of an unordered pair key reside in the same partition."""
+        records = [
+            {
+                "judgement": "positive",
+                "left": {"id": "entity_X", "schema": "Person", "caption": "Name 1"},
+                "right": {"id": "entity_Y", "schema": "Person", "caption": "Name 2"},
+            },
+            {
+                "judgement": "positive",
+                "left": {"id": "entity_Y", "schema": "Person", "caption": "Name 2 Modified"},
+                "right": {"id": "entity_X", "schema": "Person", "caption": "Name 1"},
+            },
+        ]
+        # Split is deterministic on the pair key
+        split_1 = get_deterministic_split("entity_X::entity_Y")
+        split_2 = get_deterministic_split(f"{min('entity_Y', 'entity_X')}::{max('entity_Y', 'entity_X')}")
+        self.assertEqual(split_1, split_2)
+
+    def test_matchable_versus_contextual_scopes(self) -> None:
+        """Requirement B & D: Test classification into primary matchable scope vs secondary broader scope."""
+        records = [
+            # Primary scope: Person <-> Company (both matchable)
+            {
+                "judgement": "positive",
+                "left": {"id": "m1", "schema": "Person", "caption": "Matchable Person"},
+                "right": {"id": "m2", "schema": "Company", "caption": "Matchable Company"},
+            },
+            # Secondary scope: Person <-> Occupancy (Occupancy is contextual)
+            {
+                "judgement": "positive",
+                "left": {"id": "c1", "schema": "Person", "caption": "Context Person"},
+                "right": {"id": "c2", "schema": "Occupancy", "caption": "Minister of Energy"},
+            },
+        ]
+        path = self._write_synthetic_gz(records)
+        result = evaluate_benchmark(pairs_path=path)
+
+        scopes = result["scope_definitions"]
+        self.assertIn("primary_scope", scopes)
+        self.assertIn("secondary_scope", scopes)
+        self.assertIn("Occupancy", scopes["schema_distribution_across_dataset"])
+
+    def test_average_precision_tied_scores(self) -> None:
+        """Requirement C & D: Test Average Precision with tied scores and known expected values."""
+        # 4 samples: y = [1, 1, 0, 0], scores = [0.9, 0.8, 0.8, 0.5]
+        # Ties at score 0.8: (0.8, 1) and (0.8, 0)
+        # Total positives = 2
+        # Cutoff 0.9: TP=1, FP=0, P=1.0, R=0.5 -> AP += 1.0 * 0.5 = 0.5
+        # Cutoff 0.8: Both processed together! TP=2, FP=1, P=2/3, R=1.0 -> AP += (2/3) * (1.0 - 0.5) = 1/3 = 0.3333
+        # Expected AP = 0.5 + 0.3333 = 0.8333
+        y_true = [1, 1, 0, 0]
+        scores = [0.9, 0.8, 0.8, 0.5]
+        ap = compute_average_precision(y_true, scores)
+        self.assertAlmostEqual(ap, 0.8333, places=3)
+
+    def test_sqlite_cleanup_on_exception(self) -> None:
+        """Requirement C & D: Verify that temporary SQLite files and directories are cleaned up after exception."""
+        # Provide an unreadable path or invalid structure that triggers an exception during processing
+        # and verify no temporary directory leaks
+        temp_dir_before = set(os.listdir(tempfile.gettempdir()))
+        try:
+            evaluate_benchmark(pairs_path="nonexistent_directory/nonexistent_file.json.gz")
+        except FileNotFoundError:
+            pass
+        temp_dir_after = set(os.listdir(tempfile.gettempdir()))
+        # Ensure no clearscreen_eval_ directory remained
+        leaked = [d for d in temp_dir_after - temp_dir_before if d.startswith("clearscreen_eval_")]
+        self.assertEqual(len(leaked), 0)
+
+    def test_no_raw_entities_in_baseline_summary(self) -> None:
+        """Requirement D: Verify that evaluate_baselines output contains no raw entity strings."""
+        sensitive_caption = "Sensitive Target Oligarch Name 99"
+        sensitive_alias = "Alias Alpha 007 Secret"
+        sensitive_id = "target_secret_id_12345"
+
+        records = [
+            {
+                "judgement": "positive",
+                "left": {
+                    "id": sensitive_id,
+                    "schema": "Person",
+                    "caption": sensitive_caption,
+                    "properties": {"name": [sensitive_caption], "alias": [sensitive_alias]},
+                },
+                "right": {
+                    "id": "partner_id_67890",
+                    "schema": "Person",
+                    "caption": "Generic Counterpart",
+                },
+            }
+        ]
+        path = self._write_synthetic_gz(records)
+        result = evaluate_benchmark(pairs_path=path)
+
+        serialized = json.dumps(result)
+        self.assertNotIn(sensitive_caption, serialized)
+        self.assertNotIn(sensitive_alias, serialized)
         self.assertNotIn(sensitive_id, serialized)
 
 

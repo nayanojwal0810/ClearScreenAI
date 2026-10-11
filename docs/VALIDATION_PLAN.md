@@ -56,11 +56,19 @@ Record the source URL and title with every retrieved chunk. Do not invent legal 
 
 ### Gate 1 — non-neural baselines (full eligible corpus)
 
-- Baseline A: Unicode/case/whitespace-normalized exact name and alias matching.
-- Baseline B: a transparent character/token fuzzy match using RapidFuzz.
-- Where feasible, add a small tabular baseline using field-level similarities and conflicts (alias, date of birth, country/nationality, identifiers, entity type). Exclude source entity IDs and any other fields that reveal label or record linkage identity.
-- Use one documented deterministic split and threshold selection on validation data only. Do not tune on the final test set. Do not report pair-row random splitting as entity-level generalization.
-- Use precision, recall, F1, Average Precision (AP), and confusion matrix. For discrete binary baselines without continuous scores, report precision, recall, and F1, noting that AP/PR-AUC is not applicable. State that benchmark class prevalence does not represent real-world customer screening prevalence.
+- **Evaluation Scopes**:
+  - **Primary scope (direct sanctions screening)**: Observations where both entities use official matchable schema types (`Person`, `Company`, `Organization`, `LegalEntity`, `Security`, `CryptoWallet`, `Vessel`, `Airplane`, `PublicBody`), with conflicting-label pair groups excluded.
+  - **Secondary scope (broader entity matching)**: The broader benchmark including contextual schemas (`Occupancy`, `Succession`, `Position`, `Directorship`, `Ownership`, etc.), with the same conflict-exclusion policy and reported schema distribution.
+- **Duplicate & Conflict Policy**:
+  - Assign observations to deterministic splits (Train 70%, Val 15%, Test 15%) using the unordered pair key, ensuring all versions of a pair key reside in the same partition.
+  - Preserve distinct entity payload versions of repeated pair keys.
+  - Deduplicate only exact repeated observations (identical pair key, canonical payload hash, and label).
+  - Exclude conflicting-label pair groups (both positive and negative judgements on the same pair key) from primary clean metrics, retaining them in diagnostic reporting.
+- Baseline A: Unicode/case/whitespace-normalized exact name and caption matching.
+- Baseline B: Exact match over available alias values.
+- Baseline C: Transparent character/token fuzzy match using RapidFuzz with threshold tuned on validation data only.
+- Evaluation metrics: Precision, recall, F1, Average Precision (AP, tie-score aware), and confusion matrix. For discrete binary baselines without continuous scores, AP is recorded as not applicable.
+- Report metrics separately for primary matchable scope and secondary broader scope. Pair-level evaluation limitation remains explicitly disclosed without claiming unseen-entity generalization.
 
 ### Gate 2 — neural signal (full eligible corpus; one controlled run)
 
