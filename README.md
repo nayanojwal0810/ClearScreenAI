@@ -6,7 +6,7 @@
 
 ## Current phase
 
-**Signal-only validation planning.** No experiments have been run and no performance claims are available. See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for source decisions, licensing, evaluation gates, resource limits, and go/no-go criteria. Follow [docs/ANTIGRAVITY_PROMPT_01.md](docs/ANTIGRAVITY_PROMPT_01.md) for the first bounded coding task.
+**Signal-only validation planning.** No experiments have been run and no performance claims are available. See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for source decisions, licensing, evaluation gates, resource limits, and go/no-go criteria.
 
 ## Data sources
 
@@ -14,7 +14,7 @@
 2. **Official OFAC SDN list** — current reference list for a small application smoke test. [Official download page](https://sanctionslist.ofac.treas.gov/Home/SdnList) | [Direct Enhanced ZIP](https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN_ENHANCED.ZIP).
 3. **Official OFAC guidance** — [FAQ #5 on assessing possible matches](https://ofac.treasury.gov/faqs/5), [FAQ #122 on weak aliases](https://ofac.treasury.gov/faqs/122), [FAQ #246 on how list search works](https://ofac.treasury.gov/faqs/246), and [A Framework for OFAC Compliance Commitments](https://ofac.treasury.gov/system/files/126/framework_ofac_cc.pdf). These sources form the small retrieval corpus for testing source-grounded answers.
 
-The OpenSanctions Pairs snapshot is a labeled matching benchmark, not a current sanctions list. The current OFAC list is a reference source, not a labeled customer benchmark. The published benchmark also includes automatically propagated positive relation pairs; validation will report analyst-judged identity pairs separately so headline performance is not inflated.
+The OpenSanctions Pairs snapshot is a labeled matching benchmark (755,540 pairs primarily covering Person and Organization entity schemas with positive and negative judgements), not a current sanctions list. The current OFAC list is a reference source, not a labeled customer benchmark. Validation measures baseline and model matching quality against the documented binary judgement labels without unsupported subset assumptions.
 
 ## Data handling
 

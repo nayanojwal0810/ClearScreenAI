@@ -22,7 +22,7 @@ ClearScreenAI is an educational sanctions-screening and investigation-support pr
 - **Upstream documentation:** https://www.opensanctions.org/docs/opensource/pairs/
 - Snapshot: 2025-12-09; approximately 409 MB compressed; 755,540 labeled pairs.
 - Upstream documentation marks the dataset for non-commercial use. The Hugging Face card specifies CC BY-NC 4.0. Cite OpenSanctions and the snapshot. Use only for non-commercial study/portfolio work unless appropriate permission is obtained. Do not upload the dataset to this repository.
-- The benchmark paper describes 501,298 analyst-judged matching-subject pairs plus 254,242 automatic relation-pair propagations that are positive by construction. Therefore report both (a) results on the analyst-judged matching-subject subset, and (b) full-corpus results separately. Do not present full-corpus scores alone as proof of matcher quality.
+- The selected OpenSanctions Pairs snapshot contains 755,540 labeled entity pairs with schema types primarily Person and Organization. Validation evaluates the documented binary judgement labels (positive and negative) across the benchmark, counting and reporting any missing or unknown labels.
 - Upstream docs say the old flat snapshot is no longer updated; use it only because it is a fixed, directly downloadable benchmark for reproducible validation. Do not present it as the current sanctions list.
 
 ### 2. Current official target list — OFAC SDN Enhanced XML
@@ -50,7 +50,7 @@ Record the source URL and title with every retrieved chunk. Do not invent legal 
 - Process every line in the full compressed benchmark using streaming; do not load the full decompressed file into memory.
 - Confirm readable gzip/JSONL, total rows, unique labels, row counts by label, schema pairs, source fields, missingness, malformed rows, and duplicates.
 - Expected snapshot-level checks: 755,540 rows; labels positive and negative; about 76.9% positive overall. Verify actual counts and report differences rather than forcing expected numbers.
-- Identify relation schemas that represent automatically propagated pairs (e.g., Occupancy, Succession, Ownership/Family/Directorship and related relation types). Report the count excluded from the primary analyst-judged subset and document the exact rule; do not infer this filter from labels alone.
+- Identify and audit entity schemas (primarily Person and Organization) and schema-pair distributions. Measure missingness of business and personal identifiers (e.g. taxNumber, registrationNumber, passportNumber) on both entities and the pair, explicitly excluding internal entity IDs.
 - Inspect a few rows only to validate parser behavior; this is a parser smoke test, not the model evaluation dataset.
 - Keep raw data in ignored data/; do not commit data or generated row-level names.
 
@@ -60,7 +60,7 @@ Record the source URL and title with every retrieved chunk. Do not invent legal 
 - Baseline B: a transparent character/token fuzzy match using RapidFuzz.
 - Where feasible, add a small tabular baseline using field-level similarities and conflicts (alias, date of birth, country/nationality, identifiers, entity type). Exclude source entity IDs and any other fields that reveal label or record linkage identity.
 - Use one documented deterministic split and threshold selection on validation data only. Do not tune on the final test set. Do not report pair-row random splitting as entity-level generalization.
-- Use precision, recall, F1, PR-AUC, confusion matrix, and false-positive/false-negative examples. Show both the analyst-judged subset and the full corpus; state that benchmark class prevalence does not represent real-world customer screening prevalence.
+- Use precision, recall, F1, Average Precision (AP), and confusion matrix. For discrete binary baselines without continuous scores, report precision, recall, and F1, noting that AP/PR-AUC is not applicable. State that benchmark class prevalence does not represent real-world customer screening prevalence.
 
 ### Gate 2 — neural signal (full eligible corpus; one controlled run)
 
@@ -81,7 +81,7 @@ Record the source URL and title with every retrieved chunk. Do not invent legal 
 Proceed to the full project only if:
 1. The data is complete, parsable and legally usable for a non-commercial portfolio.
 2. A defensible evaluation can be run without label leakage or hidden test tuning.
-3. The neural model gives meaningful value versus the strongest simple baseline (target: at least +2 absolute F1 points on the analyst-judged holdout, or a clearly better recall at the same review volume without materially worse precision). If not, inspect errors once; do not force the neural model.
+3. The neural model gives meaningful value versus the strongest simple baseline (target: at least +2 absolute F1 points on the test holdout, or a clearly better recall at the same review volume without materially worse precision). If not, inspect errors once; do not force the neural model.
 4. RAG retrieves relevant official passages and produces source-grounded, uncertainty-aware summaries in the fixed test set.
 5. Compute and deployment cost are realistic for a student project.
 

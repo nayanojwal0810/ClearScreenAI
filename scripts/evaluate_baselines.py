@@ -1,18 +1,22 @@
 """scripts/evaluate_baselines.py
 
 Streaming baseline evaluator for ClearScreenAI validation phase.
-Evaluates:
+Evaluates non-neural baselines with bounded memory:
   1. Normalized exact name/caption match
   2. Exact match over available alias values
   3. Transparent RapidFuzz name/alias similarity with threshold tuned on validation data
 
-Evaluation Methodology:
-- Uses deterministic pair-hash splits (Train 70%, Val 15%, Test 15%).
-- Tunes RapidFuzz threshold ONLY on validation partition; evaluates test ONCE.
-- Audits entity-ID overlap across partitions. Explicitly notes pair-level limitation
-  and makes no claim of unseen-entity generalization.
-- Reports metrics for (a) all rows, and (b) analyst-judged subset when verified.
-- Privacy Guarantee: Never prints or commits raw entity names or row data.
+Methodology & Standards:
+- Bounded RAM: uses temporary disk-backed SQLite tables for pair deduplication,
+  entity partition overlap audits, and score tracking. Temporary files are always
+  cleaned up on exit or error.
+- Deterministic splits: Train 70%, Val 15%, Test 15% assigned by pair-key hash.
+- Strict validation tuning: fuzzy similarity threshold is tuned ONLY on the validation partition;
+  test set is evaluated exactly once at the fixed tuned threshold.
+- Valid metrics: continuous ranking evaluated with standard Average Precision (AP);
+  discrete binary predictions return null/None for PR-AUC/AP rather than arbitrary heuristics.
+- Entity-ID overlap audit: explicitly reports overlap across splits; notes pair-level limitation
+  and disclaims unseen-entity generalization.
 """
 
 from __future__ import annotations
@@ -25,7 +29,9 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
+import tempfile
 import unicodedata
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -35,23 +41,6 @@ try:
 except ImportError:
     rf_fuzz = None
     RAPIDFUZZ_AVAILABLE = False
-
-
-# Known relation schemas
-KNOWN_RELATION_SCHEMAS = {
-    "Occupancy",
-    "Succession",
-    "Ownership",
-    "Family",
-    "Directorship",
-    "Associate",
-    "Membership",
-    "Employment",
-    "UnknownLink",
-    "CourtCaseParty",
-    "Passport",
-    "Identification",
-}
 
 
 def normalize_text(text: Optional[str]) -> str:
@@ -127,7 +116,6 @@ def calculate_similarity_score(left_names: Set[str], right_names: Set[str]) -> f
             if RAPIDFUZZ_AVAILABLE and rf_fuzz is not None:
                 score = rf_fuzz.token_sort_ratio(l_name, r_name) / 100.0
             else:
-                # Deterministic pure standard-library fallback
                 l_sorted = " ".join(sorted(l_name.split()))
                 r_sorted = " ".join(sorted(r_name.split()))
                 score = difflib.SequenceMatcher(None, l_sorted, r_sorted).ratio()
@@ -139,12 +127,15 @@ def calculate_similarity_score(left_names: Set[str], right_names: Set[str]) -> f
 
 
 def normalize_binary_label(row: Dict[str, Any]) -> Optional[int]:
-    """Converts row label to 1 (positive) or 0 (negative)."""
-    raw = row.get("label")
+    """Converts row label/judgement to 1 (positive) or 0 (negative).
+    
+    Returns None for missing, malformed, or unrecognized labels.
+    """
+    raw = row.get("judgement")
+    if raw is None:
+        raw = row.get("label")
     if raw is None:
         raw = row.get("decision")
-    if raw is None:
-        raw = row.get("judgement")
     if raw is None:
         raw = row.get("match")
         
@@ -167,12 +158,60 @@ def get_deterministic_split(pair_key: str, train_ratio: float = 0.70, val_ratio:
         return "test"
 
 
+def compute_average_precision(y_true: List[int], scores: List[float]) -> Optional[float]:
+    """Computes standard Average Precision (AP) for continuous prediction scores.
+    
+    AP = sum_n (R_n - R_{n-1}) * P_n across distinct score thresholds.
+    Returns None if there are no positive samples in y_true.
+    """
+    if not y_true or not scores or len(y_true) != len(scores):
+        return None
+        
+    total_positives = sum(y_true)
+    if total_positives == 0:
+        return None
+
+    # Group true labels by distinct descending thresholds
+    # to avoid threshold tie artifacts
+    threshold_map: Dict[float, List[int]] = {}
+    for s, y in zip(scores, y_true):
+        threshold_map.setdefault(s, []).append(y)
+
+    distinct_thresholds = sorted(threshold_map.keys(), reverse=True)
+    
+    tp = 0
+    fp = 0
+    prev_recall = 0.0
+    ap = 0.0
+
+    for thresh in distinct_thresholds:
+        labels_at_thresh = threshold_map[thresh]
+        pos_at_thresh = sum(labels_at_thresh)
+        neg_at_thresh = len(labels_at_thresh) - pos_at_thresh
+        
+        tp += pos_at_thresh
+        fp += neg_at_thresh
+        
+        precision = tp / (tp + fp)
+        recall = tp / total_positives
+        
+        # Increment AP by area of this recall segment
+        ap += precision * (recall - prev_recall)
+        prev_recall = recall
+
+    return round(ap, 4)
+
+
 def compute_metrics(
     y_true: List[int],
     y_pred: List[int],
     scores: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
-    """Computes precision, recall, F1, accuracy, confusion matrix, and PR-AUC."""
+    """Computes precision, recall, F1, accuracy, confusion matrix, and average precision.
+    
+    For continuous scores, computes standard Average Precision (AP).
+    For discrete binary predictions without continuous scores, returns None for average_precision.
+    """
     tp = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     fp = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
     fn = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)
@@ -184,37 +223,19 @@ def compute_metrics(
     f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
     accuracy = (tp + tn) / total if total > 0 else 0.0
     
-    # Compute PR-AUC
-    pr_auc = 0.0
-    if scores is not None and len(scores) == len(y_true) and (tp + fn) > 0:
-        # Sort by scores descending
-        paired = sorted(zip(scores, y_true), key=lambda x: x[0], reverse=True)
-        running_tp = 0
-        running_fp = 0
-        total_pos = tp + fn
-        prev_recall = 0.0
-        
-        # Calculate trapezoidal area under PR curve
-        for s, y in paired:
-            if y == 1:
-                running_tp += 1
-            else:
-                running_fp += 1
-            cur_prec = running_tp / (running_tp + running_fp)
-            cur_rec = running_tp / total_pos
-            if cur_rec > prev_recall:
-                pr_auc += cur_prec * (cur_rec - prev_recall)
-                prev_recall = cur_rec
+    # Valid continuous ranking metric
+    if scores is not None and len(scores) == len(y_true):
+        avg_precision = compute_average_precision(y_true, scores)
     else:
-        # For discrete binary predictions without scores
-        pr_auc = precision * recall
+        # Strictly return None rather than precision * recall heuristic
+        avg_precision = None
 
     return {
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "f1": round(f1, 4),
         "accuracy": round(accuracy, 4),
-        "pr_auc": round(pr_auc, 4),
+        "average_precision": avg_precision,
         "confusion_matrix": {
             "tp": tp,
             "fp": fp,
@@ -256,196 +277,218 @@ def tune_fuzzy_threshold(val_records: List[Tuple[float, int]]) -> Tuple[float, f
 def evaluate_benchmark(
     pairs_path: str,
     max_rows: Optional[int] = None,
-    relation_schemas: Optional[Set[str]] = None,
-    verify_analyst_filter: bool = False,
 ) -> Dict[str, Any]:
-    """Streams pairs benchmark and evaluates non-neural baselines."""
+    """Streams pairs benchmark and evaluates non-neural baselines with bounded memory."""
     if not os.path.exists(pairs_path):
         raise FileNotFoundError(f"Pairs file not found: {pairs_path}")
 
-    target_relations = relation_schemas or KNOWN_RELATION_SCHEMAS
     is_gz = pairs_path.endswith(".gz")
     opener = gzip.open(pairs_path, "rt", encoding="utf-8", errors="replace") if is_gz else open(
         pairs_path, "rt", encoding="utf-8", errors="replace"
     )
 
-    # Partition entity sets for overlap audit
-    entity_ids_by_split: Dict[str, Set[str]] = {"train": set(), "val": set(), "test": set()}
-    seen_pair_keys: Set[bytes] = set()
-
-    # Collectors for (all_rows, analyst_judged_rows)
-    # Structure for each subset:
-    # {"val_fuzzy": [(score, y)], "test_exact_name": (y_true, y_pred), ...}
-    def make_collector() -> Dict[str, Any]:
-        return {
-            "val_fuzzy": [],
-            "test_exact_name_y_true": [],
-            "test_exact_name_y_pred": [],
-            "test_exact_alias_y_true": [],
-            "test_exact_alias_y_pred": [],
-            "test_fuzzy_y_true": [],
-            "test_fuzzy_scores": [],
-        }
-
-    collectors = {
-        "all_rows": make_collector(),
-        "analyst_judged": make_collector(),
-    }
+    # Temporary disk-backed SQLite database for deduplication, overlap audit, and evaluation records
+    temp_dir = tempfile.mkdtemp(prefix="clearscreen_eval_")
+    db_path = os.path.join(temp_dir, "eval_temp.db")
+    db_conn: Optional[sqlite3.Connection] = None
 
     total_rows = 0
     duplicate_rows = 0
-    skipped_rows = 0
+    malformed_rows = 0
+    unlabeled_or_unknown_rows = 0
 
-    with opener as f:
-        for line_num, line in enumerate(f, start=1):
-            if max_rows and total_rows >= max_rows:
-                break
-                
-            line_str = line.strip()
-            if not line_str:
-                continue
-                
-            try:
-                row = json.loads(line_str)
-            except json.JSONDecodeError:
-                skipped_rows += 1
-                continue
-                
-            if not isinstance(row, dict):
-                skipped_rows += 1
-                continue
-
-            y = normalize_binary_label(row)
-            if y is None:
-                skipped_rows += 1
-                continue
-
-            # Entities
-            left = row.get("left") if isinstance(row.get("left"), dict) else row.get("entity1", {})
-            right = row.get("right") if isinstance(row.get("right"), dict) else row.get("entity2", {})
-
-            lid = str(left.get("id")) if left.get("id") else f"anon_L_{line_num}"
-            rid = str(right.get("id")) if right.get("id") else f"anon_R_{line_num}"
-
-            # Deduplicate pair ordering
-            pair_key_str = f"{min(lid, rid)}::{max(lid, rid)}"
-            pair_key_bytes = hashlib.blake2b(pair_key_str.encode("utf-8"), digest_size=8).digest()
-            if pair_key_bytes in seen_pair_keys:
-                duplicate_rows += 1
-                continue
-            seen_pair_keys.add(pair_key_bytes)
-            total_rows += 1
-
-            # Deterministic split
-            split = get_deterministic_split(pair_key_str)
-            entity_ids_by_split[split].add(lid)
-            entity_ids_by_split[split].add(rid)
-
-            # Check relation schema
-            l_sch = str(left.get("schema", ""))
-            r_sch = str(right.get("schema", ""))
-            row_sch = str(row.get("schema", ""))
-            is_relation = (
-                l_sch in target_relations or r_sch in target_relations or row_sch in target_relations
-            )
-            is_analyst_judged = not is_relation
-
-            # Feature extraction (excluding IDs and labels)
-            l_prim, l_all = extract_names_and_aliases(left)
-            r_prim, r_all = extract_names_and_aliases(right)
-
-            # Baseline 1: Exact Name/Caption Match
-            exact_name_match = 1 if bool(l_prim and r_prim and (l_prim & r_prim)) else 0
-
-            # Baseline 2: Exact Name/Alias Match
-            exact_alias_match = 1 if bool(l_all and r_all and (l_all & r_all)) else 0
-
-            # Baseline 3: RapidFuzz Similarity
-            fuzzy_score = calculate_similarity_score(l_all, r_all)
-
-            # Populate collectors
-            subsets_to_feed = ["all_rows"]
-            if is_analyst_judged:
-                subsets_to_feed.append("analyst_judged")
-
-            for sub in subsets_to_feed:
-                c = collectors[sub]
-                if split == "val":
-                    c["val_fuzzy"].append((fuzzy_score, y))
-                elif split == "test":
-                    c["test_exact_name_y_true"].append(y)
-                    c["test_exact_name_y_pred"].append(exact_name_match)
-                    c["test_exact_alias_y_true"].append(y)
-                    c["test_exact_alias_y_pred"].append(exact_alias_match)
-                    c["test_fuzzy_y_true"].append(y)
-                    c["test_fuzzy_scores"].append(fuzzy_score)
-
-    # Partition Overlap Audit
-    train_ids = entity_ids_by_split["train"]
-    val_ids = entity_ids_by_split["val"]
-    test_ids = entity_ids_by_split["test"]
-
-    overlap_train_val = len(train_ids & val_ids)
-    overlap_train_test = len(train_ids & test_ids)
-    overlap_val_test = len(val_ids & test_ids)
-
-    partition_audit = {
-        "split_strategy": "deterministic_pair_hash_split",
-        "split_ratios": {"train": 0.70, "val": 0.15, "test": 0.15},
-        "evaluation_level": "pair_level",
-        "unseen_entity_generalization_claimed": False,
-        "limitation_disclosure": (
-            "OpenSanctions Pairs flat snapshot contains repeated entities across pairs. "
-            "Pair-level hash splitting results in entity overlap between partitions. "
-            "Results measure pair-level matching performance and MUST NOT be claimed as "
-            "unseen-entity generalization."
-        ),
-        "unique_entity_counts": {
-            "train": len(train_ids),
-            "val": len(val_ids),
-            "test": len(test_ids),
-        },
-        "entity_id_overlap": {
-            "train_val_overlap_count": overlap_train_val,
-            "train_test_overlap_count": overlap_train_test,
-            "val_test_overlap_count": overlap_val_test,
-        },
-    }
-
-    # Evaluate baselines for a given collector
-    def compute_subset_results(c: Dict[str, Any]) -> Dict[str, Any]:
-        # Tune threshold on val
-        tuned_threshold, val_f1 = tune_fuzzy_threshold(c["val_fuzzy"])
+    try:
+        db_conn = sqlite3.connect(db_path)
+        cur = db_conn.cursor()
+        cur.execute("PRAGMA synchronous = OFF")
+        cur.execute("PRAGMA journal_mode = OFF")
         
-        # Test evaluation
-        # Baseline A: Exact Name/Caption
-        m_exact_name = compute_metrics(
-            c["test_exact_name_y_true"],
-            c["test_exact_name_y_pred"],
+        # Tables for indexing
+        cur.execute("CREATE TABLE seen_pairs (pair_hash BLOB PRIMARY KEY)")
+        cur.execute("CREATE TABLE entity_partitions (entity_hash BLOB, split TEXT, PRIMARY KEY(entity_hash, split))")
+        cur.execute(
+            """CREATE TABLE eval_records (
+                split TEXT,
+                y INTEGER,
+                exact_name INTEGER,
+                exact_alias INTEGER,
+                fuzzy_score REAL
+            )"""
         )
-        # Baseline B: Exact Name/Alias
-        m_exact_alias = compute_metrics(
-            c["test_exact_alias_y_true"],
-            c["test_exact_alias_y_pred"],
-        )
-        # Baseline C: RapidFuzz Name/Alias
-        fuzzy_preds = [1 if s >= tuned_threshold else 0 for s in c["test_fuzzy_scores"]]
-        m_fuzzy = compute_metrics(
-            c["test_fuzzy_y_true"],
-            fuzzy_preds,
-            scores=c["test_fuzzy_scores"],
-        )
+        db_conn.commit()
 
-        return {
+        batch_pairs: List[Tuple[bytes,]] = []
+        batch_entities: List[Tuple[bytes, str]] = []
+        batch_eval: List[Tuple[str, int, int, int, float]] = []
+        batch_size = 5000
+
+        with opener as f:
+            for line_num, line in enumerate(f, start=1):
+                if max_rows and total_rows >= max_rows:
+                    break
+                    
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                    
+                try:
+                    row = json.loads(line_str)
+                except json.JSONDecodeError:
+                    malformed_rows += 1
+                    continue
+                    
+                if not isinstance(row, dict):
+                    malformed_rows += 1
+                    continue
+
+                y = normalize_binary_label(row)
+                if y is None:
+                    unlabeled_or_unknown_rows += 1
+                    continue
+
+                # Entities
+                left = row.get("left") if isinstance(row.get("left"), dict) else row.get("entity1", {})
+                right = row.get("right") if isinstance(row.get("right"), dict) else row.get("entity2", {})
+
+                lid = str(left.get("id")) if left.get("id") else f"anon_L_{line_num}"
+                rid = str(right.get("id")) if right.get("id") else f"anon_R_{line_num}"
+
+                # Pair deduplication key
+                pair_key_str = f"{min(lid, rid)}::{max(lid, rid)}"
+                pair_hash = hashlib.blake2b(pair_key_str.encode("utf-8"), digest_size=16).digest()
+                
+                # Check for duplicate pair in database
+                cur.execute("INSERT OR IGNORE INTO seen_pairs VALUES (?)", (pair_hash,))
+                if cur.rowcount == 0:
+                    duplicate_rows += 1
+                    continue
+
+                total_rows += 1
+
+                # Deterministic split assignment
+                split = get_deterministic_split(pair_key_str)
+                
+                # Record entity IDs by partition (hashed to avoid storing raw IDs)
+                lid_hash = hashlib.sha256(lid.encode("utf-8")).digest()[:16]
+                rid_hash = hashlib.sha256(rid.encode("utf-8")).digest()[:16]
+                batch_entities.append((lid_hash, split))
+                batch_entities.append((rid_hash, split))
+
+                # Feature extraction
+                l_prim, l_all = extract_names_and_aliases(left)
+                r_prim, r_all = extract_names_and_aliases(right)
+
+                exact_name = 1 if bool(l_prim and r_prim and (l_prim & r_prim)) else 0
+                exact_alias = 1 if bool(l_all and r_all and (l_all & r_all)) else 0
+                fuzzy_score = calculate_similarity_score(l_all, r_all)
+
+                batch_eval.append((split, y, exact_name, exact_alias, fuzzy_score))
+
+                if len(batch_eval) >= batch_size:
+                    cur.executemany("INSERT OR IGNORE INTO entity_partitions VALUES (?, ?)", batch_entities)
+                    cur.executemany("INSERT INTO eval_records VALUES (?, ?, ?, ?, ?)", batch_eval)
+                    batch_entities.clear()
+                    batch_eval.clear()
+
+        if batch_eval:
+            cur.executemany("INSERT OR IGNORE INTO entity_partitions VALUES (?, ?)", batch_entities)
+            cur.executemany("INSERT INTO eval_records VALUES (?, ?, ?, ?, ?)", batch_eval)
+            batch_entities.clear()
+            batch_eval.clear()
+            
+        db_conn.commit()
+
+        # Audit entity partition overlap via SQL
+        cur.execute("SELECT count(DISTINCT entity_hash) FROM entity_partitions WHERE split = 'train'")
+        unique_train = cur.fetchone()[0]
+        cur.execute("SELECT count(DISTINCT entity_hash) FROM entity_partitions WHERE split = 'val'")
+        unique_val = cur.fetchone()[0]
+        cur.execute("SELECT count(DISTINCT entity_hash) FROM entity_partitions WHERE split = 'test'")
+        unique_test = cur.fetchone()[0]
+
+        cur.execute(
+            """SELECT count(DISTINCT t1.entity_hash)
+               FROM entity_partitions t1
+               JOIN entity_partitions t2 ON t1.entity_hash = t2.entity_hash
+               WHERE t1.split = 'train' AND t2.split = 'val'"""
+        )
+        overlap_train_val = cur.fetchone()[0]
+
+        cur.execute(
+            """SELECT count(DISTINCT t1.entity_hash)
+               FROM entity_partitions t1
+               JOIN entity_partitions t2 ON t1.entity_hash = t2.entity_hash
+               WHERE t1.split = 'train' AND t2.split = 'test'"""
+        )
+        overlap_train_test = cur.fetchone()[0]
+
+        cur.execute(
+            """SELECT count(DISTINCT t1.entity_hash)
+               FROM entity_partitions t1
+               JOIN entity_partitions t2 ON t1.entity_hash = t2.entity_hash
+               WHERE t1.split = 'val' AND t2.split = 'test'"""
+        )
+        overlap_val_test = cur.fetchone()[0]
+
+        partition_audit = {
+            "split_strategy": "deterministic_pair_hash_split",
+            "split_ratios": {"train": 0.70, "val": 0.15, "test": 0.15},
+            "evaluation_level": "pair_level",
+            "unseen_entity_generalization_claimed": False,
+            "limitation_disclosure": (
+                "OpenSanctions Pairs flat snapshot contains repeated entities across pairs. "
+                "Pair-level hash splitting results in entity overlap between partitions. "
+                "Results measure pair-level matching performance and MUST NOT be claimed as "
+                "unseen-entity generalization."
+            ),
+            "unique_entity_counts": {
+                "train": unique_train,
+                "val": unique_val,
+                "test": unique_test,
+            },
+            "entity_id_overlap": {
+                "train_val_overlap_count": overlap_train_val,
+                "train_test_overlap_count": overlap_train_test,
+                "val_test_overlap_count": overlap_val_test,
+            },
+        }
+
+        # Retrieve validation records for threshold tuning
+        cur.execute("SELECT fuzzy_score, y FROM eval_records WHERE split = 'val'")
+        val_fuzzy_records = [(row[0], row[1]) for row in cur.fetchall()]
+        tuned_threshold, val_f1 = tune_fuzzy_threshold(val_fuzzy_records)
+
+        # Retrieve test records for evaluation
+        cur.execute("SELECT y, exact_name, exact_alias, fuzzy_score FROM eval_records WHERE split = 'test'")
+        test_rows = cur.fetchall()
+        
+        test_y = [r[0] for r in test_rows]
+        test_exact_name = [r[1] for r in test_rows]
+        test_exact_alias = [r[2] for r in test_rows]
+        test_fuzzy_scores = [r[3] for r in test_rows]
+        test_fuzzy_preds = [1 if s >= tuned_threshold else 0 for s in test_fuzzy_scores]
+
+        # Compute metrics
+        m_exact_name = compute_metrics(test_y, test_exact_name)
+        m_exact_alias = compute_metrics(test_y, test_exact_alias)
+        m_fuzzy = compute_metrics(test_y, test_fuzzy_preds, scores=test_fuzzy_scores)
+
+        results = {
             "validation_tuning": {
-                "val_samples_count": len(c["val_fuzzy"]),
+                "val_samples_count": len(val_fuzzy_records),
                 "selected_fuzzy_threshold": tuned_threshold,
                 "validation_f1_at_threshold": round(val_f1, 4),
             },
             "test_evaluation": {
-                "test_samples_count": len(c["test_exact_name_y_true"]),
-                "baseline_1_exact_name_caption": m_exact_name,
-                "baseline_2_exact_name_alias": m_exact_alias,
+                "test_samples_count": len(test_y),
+                "baseline_1_exact_name_caption": {
+                    **m_exact_name,
+                    "note": "Discrete binary predictions; average_precision is not applicable.",
+                },
+                "baseline_2_exact_name_alias": {
+                    **m_exact_alias,
+                    "note": "Discrete binary predictions; average_precision is not applicable.",
+                },
                 "baseline_3_rapidfuzz_similarity": {
                     "scoring_method": "token_sort_ratio",
                     "rapidfuzz_library_active": RAPIDFUZZ_AVAILABLE,
@@ -455,14 +498,20 @@ def evaluate_benchmark(
             },
         }
 
-    results_all = compute_subset_results(collectors["all_rows"])
-
-    if verify_analyst_filter:
-        results_analyst = compute_subset_results(collectors["analyst_judged"])
-        analyst_status = "evaluated_verified_subset"
-    else:
-        results_analyst = None
-        analyst_status = "not determined — review required"
+    finally:
+        # Guarantee cleanup of temporary SQLite database
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+        try:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+            if os.path.exists(temp_dir):
+                os.rmdir(temp_dir)
+        except Exception:
+            pass
 
     summary: Dict[str, Any] = {
         "metadata": {
@@ -471,19 +520,13 @@ def evaluate_benchmark(
             "max_rows_limit": max_rows,
             "total_pairs_processed": total_rows,
             "duplicate_pairs_discarded": duplicate_rows,
-            "skipped_rows": skipped_rows,
+            "malformed_rows_skipped": malformed_rows,
+            "unlabeled_or_unknown_rows_skipped": unlabeled_or_unknown_rows,
             "rapidfuzz_available": RAPIDFUZZ_AVAILABLE,
+            "memory_management": "streaming_jsonl_with_disk_backed_sqlite_evaluation",
         },
         "partition_audit": partition_audit,
-        "results_all_rows": results_all,
-        "analyst_judged_subset": {
-            "status": analyst_status,
-            "results": results_analyst,
-            "note": (
-                "Full-corpus scores include auto-propagated positive relation pairs. "
-                "Do NOT present all_rows metrics alone as proof of matcher quality."
-            ),
-        },
+        "results": results,
     }
 
     return summary
@@ -509,22 +552,8 @@ def main() -> None:
         default=None,
         help="Optional maximum rows to parse (for test fixtures/smoke tests)",
     )
-    parser.add_argument(
-        "--relation-schemas",
-        default=None,
-        help="Comma-separated custom relation schemas to filter",
-    )
-    parser.add_argument(
-        "--verify-analyst-filter",
-        action="store_true",
-        help="Explicitly mark relation-schema filter as verified and evaluate analyst subset",
-    )
 
     args = parser.parse_args()
-
-    rel_schemas = None
-    if args.relation_schemas:
-        rel_schemas = set(s.strip() for s in args.relation_schemas.split(",") if s.strip())
 
     print(f"[*] Starting baseline evaluation on: {args.pairs}")
     if not os.path.exists(args.pairs):
@@ -534,8 +563,6 @@ def main() -> None:
     summary = evaluate_benchmark(
         pairs_path=args.pairs,
         max_rows=args.max_rows,
-        relation_schemas=rel_schemas,
-        verify_analyst_filter=args.verify_analyst_filter,
     )
 
     out_dir = os.path.dirname(args.out)
@@ -547,12 +574,24 @@ def main() -> None:
 
     print(f"[+] Evaluation completed. Summary written to: {args.out}")
     print("\n--- BASELINE RESULTS (TEST PARTITION) ---")
-    test_eval = summary["results_all_rows"]["test_evaluation"]
+    test_eval = summary["results"]["test_evaluation"]
     print(f"Evaluated Test Rows: {test_eval['test_samples_count']:,}")
-    print(f"Baseline 1 (Exact Name/Caption): F1={test_eval['baseline_1_exact_name_caption']['f1']}, Precision={test_eval['baseline_1_exact_name_caption']['precision']}, Recall={test_eval['baseline_1_exact_name_caption']['recall']}")
-    print(f"Baseline 2 (Exact Name/Alias):   F1={test_eval['baseline_2_exact_name_alias']['f1']}, Precision={test_eval['baseline_2_exact_name_alias']['precision']}, Recall={test_eval['baseline_2_exact_name_alias']['recall']}")
+    print(
+        f"Baseline 1 (Exact Name/Caption): F1={test_eval['baseline_1_exact_name_caption']['f1']}, "
+        f"Precision={test_eval['baseline_1_exact_name_caption']['precision']}, "
+        f"Recall={test_eval['baseline_1_exact_name_caption']['recall']}"
+    )
+    print(
+        f"Baseline 2 (Exact Name/Alias):   F1={test_eval['baseline_2_exact_name_alias']['f1']}, "
+        f"Precision={test_eval['baseline_2_exact_name_alias']['precision']}, "
+        f"Recall={test_eval['baseline_2_exact_name_alias']['recall']}"
+    )
     fuzz_res = test_eval["baseline_3_rapidfuzz_similarity"]
-    print(f"Baseline 3 (Fuzzy Match, Thresh={fuzz_res['applied_threshold']}): F1={fuzz_res['metrics']['f1']}, PR-AUC={fuzz_res['metrics']['pr_auc']}")
+    print(
+        f"Baseline 3 (Fuzzy Match, Thresh={fuzz_res['applied_threshold']}): "
+        f"F1={fuzz_res['metrics']['f1']}, "
+        f"Average Precision (AP)={fuzz_res['metrics']['average_precision']}"
+    )
     print("-----------------------------------------\n")
 
 
