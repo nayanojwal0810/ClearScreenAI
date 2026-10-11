@@ -6,7 +6,7 @@
 
 ## Current phase
 
-**Signal-only validation planning.** No experiments have been run and no performance claims are available. See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for source decisions, licensing, evaluation gates, resource limits, and the go/no-go criteria.
+**Signal-only validation planning.** No experiments have been run and no performance claims are available. See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for source decisions, licensing, evaluation gates, resource limits, and go/no-go criteria. Follow [docs/ANTIGRAVITY_PROMPT_01.md](docs/ANTIGRAVITY_PROMPT_01.md) for the first bounded coding task.
 
 ## Data sources
 
