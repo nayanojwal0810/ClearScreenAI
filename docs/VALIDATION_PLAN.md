@@ -17,7 +17,7 @@ ClearScreenAI is an educational sanctions-screening and investigation-support pr
 
 ### 1. Labeled matching benchmark — OpenSanctions Pairs
 
-- **Direct download:** https://huggingface.co/datasets/sanctions-er-anon/opensanctions_pairs/resolve/main/pairs.json.gz?download=true
+- **Direct download:** https://huggingface.co/datasets/sanctions-er-anon/opensanctions_pairs/resolve/d79295c551dd36f60745aae4a2345f4c8542b037/pairs.json.gz?download=true
 - **Dataset card:** https://huggingface.co/datasets/sanctions-er-anon/opensanctions_pairs
 - **Upstream documentation:** https://www.opensanctions.org/docs/opensource/pairs/
 - Snapshot: 2025-12-09; approximately 409 MB compressed; 755,540 labeled pairs.
