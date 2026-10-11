@@ -417,6 +417,131 @@ class TestValidationScripts(unittest.TestCase):
         self.assertEqual(split_1, split_2)
         self.assertIn(split_1, ("train", "val", "test"))
 
+    def test_duplicate_pairs_diagnostics(self) -> None:
+        """Requirement C: Test duplicate pair diagnostics including same label, conflicting labels,
+        reversed order, and identical vs changed payloads."""
+        records = [
+            # Pair 1 (e1, e2) - identical payload, reversed order, same label (positive)
+            {
+                "judgement": "positive",
+                "left": {"id": "e1", "schema": "Person", "caption": "Alice Alpha", "properties": {"name": ["Alice Alpha"]}},
+                "right": {"id": "e2", "schema": "Person", "caption": "Alice A", "properties": {"name": ["Alice A"]}},
+            },
+            {
+                "judgement": "positive",
+                "left": {"id": "e2", "schema": "Person", "caption": "Alice A", "properties": {"name": ["Alice A"]}},
+                "right": {"id": "e1", "schema": "Person", "caption": "Alice Alpha", "properties": {"name": ["Alice Alpha"]}},
+            },
+            # Pair 2 (e3, e4) - identical payload, conflicting labels (positive vs negative)
+            {
+                "judgement": "positive",
+                "left": {"id": "e3", "schema": "Organization", "caption": "Beta Org"},
+                "right": {"id": "e4", "schema": "Organization", "caption": "Beta Inc"},
+            },
+            {
+                "judgement": "negative",
+                "left": {"id": "e3", "schema": "Organization", "caption": "Beta Org"},
+                "right": {"id": "e4", "schema": "Organization", "caption": "Beta Inc"},
+            },
+            # Pair 3 (e5, e6) - changed entity payload between rows
+            {
+                "judgement": "negative",
+                "left": {"id": "e5", "schema": "Company", "caption": "Gamma Corp Initial", "properties": {"name": ["Gamma Corp"]}},
+                "right": {"id": "e6", "schema": "Company", "caption": "Delta Corp", "properties": {"name": ["Delta Corp"]}},
+            },
+            {
+                "judgement": "negative",
+                "left": {"id": "e5", "schema": "Company", "caption": "Gamma Corp Updated", "properties": {"name": ["Gamma Corp"]}},
+                "right": {"id": "e6", "schema": "Company", "caption": "Delta Corp", "properties": {"name": ["Delta Corp"]}},
+            },
+            # Pair 4 (e7, e8) - unique pair
+            {
+                "judgement": "positive",
+                "left": {"id": "e7", "schema": "Person", "caption": "Unique Person"},
+                "right": {"id": "e8", "schema": "LegalEntity", "caption": "Unique Entity"},
+            },
+        ]
+        path = self._write_synthetic_gz(records)
+        summary = run_audit(pairs_path=path)
+
+        diag = summary["duplicate_pair_analysis"]
+        # Total rows with IDs: 7. Unique keys: 4 (e1-e2, e3-e4, e5-e6, e7-e8)
+        self.assertEqual(diag["total_rows_with_pair_ids"], 7)
+        self.assertEqual(diag["unique_unordered_pair_keys"], 4)
+        # Repeated keys: 3 (e1-e2, e3-e4, e5-e6)
+        self.assertEqual(diag["repeated_pair_keys"], 3)
+        # Duplicate rows: 7 - 4 = 3
+        self.assertEqual(diag["duplicate_rows"], 3)
+        # Conflicting label keys: 1 (e3-e4 has both positive and negative)
+        self.assertEqual(diag["conflicting_label_pair_keys"], 1)
+        self.assertEqual(diag["conflicting_label_rows"], 2)
+        # Identical payload repeated keys: 2 (e1-e2, e3-e4)
+        self.assertEqual(diag["repeated_pairs_identical_payload"], 2)
+        self.assertEqual(diag["repeated_rows_identical_payload"], 4)
+        # Different payload repeated keys: 1 (e5-e6 has different caption on e5)
+        self.assertEqual(diag["repeated_pairs_different_payload"], 1)
+        self.assertEqual(diag["repeated_rows_different_payload"], 2)
+
+    def test_schema_pair_label_counts(self) -> None:
+        """Requirement C: Test aggregate counts of positive and negative labels by schema pair."""
+        records = [
+            {"judgement": "positive", "left": {"id": "1", "schema": "Person"}, "right": {"id": "2", "schema": "Person"}},
+            {"judgement": "negative", "left": {"id": "3", "schema": "Person"}, "right": {"id": "4", "schema": "Person"}},
+            {"judgement": "positive", "left": {"id": "5", "schema": "Company"}, "right": {"id": "6", "schema": "Person"}},
+            {"judgement": "positive", "left": {"id": "7", "schema": "Position"}, "right": {"id": "8", "schema": "Occupancy"}},
+        ]
+        path = self._write_synthetic_gz(records)
+        summary = run_audit(pairs_path=path)
+
+        sch_labels = summary["schemas"]["schema_pair_label_counts"]
+        self.assertIn("Person <-> Person", sch_labels)
+        self.assertEqual(sch_labels["Person <-> Person"]["positive"], 1)
+        self.assertEqual(sch_labels["Person <-> Person"]["negative"], 1)
+        self.assertEqual(sch_labels["Person <-> Person"]["total"], 2)
+
+        self.assertIn("Company <-> Person", sch_labels)
+        self.assertEqual(sch_labels["Company <-> Person"]["positive"], 1)
+        self.assertEqual(sch_labels["Company <-> Person"]["negative"], 0)
+
+        self.assertIn("Occupancy <-> Position", sch_labels)
+        self.assertEqual(sch_labels["Occupancy <-> Position"]["positive"], 1)
+
+    def test_aggregate_output_contains_no_raw_entity_content(self) -> None:
+        """Requirement C: Ensure aggregate output JSON contains no raw entity content."""
+        sensitive_name = "Target Synthetic VIP Persona"
+        sensitive_alias = "Alias Synthetic VIP 007"
+        sensitive_address = "777 Secret Fictitious Boulevard"
+        sensitive_id = "vip_unique_id_9999"
+
+        records = [
+            {
+                "judgement": "positive",
+                "left": {
+                    "id": sensitive_id,
+                    "schema": "Person",
+                    "caption": sensitive_name,
+                    "properties": {
+                        "name": [sensitive_name],
+                        "alias": [sensitive_alias],
+                        "address": [sensitive_address],
+                    },
+                },
+                "right": {
+                    "id": "vip_pair_counterpart",
+                    "schema": "Person",
+                    "caption": "Counterpart Name",
+                },
+            }
+        ]
+        path = self._write_synthetic_gz(records)
+        summary = run_audit(pairs_path=path)
+
+        serialized = json.dumps(summary)
+        self.assertNotIn(sensitive_name, serialized)
+        self.assertNotIn(sensitive_alias, serialized)
+        self.assertNotIn(sensitive_address, serialized)
+        self.assertNotIn(sensitive_id, serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

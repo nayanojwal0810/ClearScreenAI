@@ -22,7 +22,7 @@ ClearScreenAI is an educational sanctions-screening and investigation-support pr
 - **Upstream documentation:** https://www.opensanctions.org/docs/opensource/pairs/
 - Snapshot: 2025-12-09; approximately 409 MB compressed; 755,540 labeled pairs.
 - Upstream documentation marks the dataset for non-commercial use. The Hugging Face card specifies CC BY-NC 4.0. Cite OpenSanctions and the snapshot. Use only for non-commercial study/portfolio work unless appropriate permission is obtained. Do not upload the dataset to this repository.
-- The selected OpenSanctions Pairs snapshot contains 755,540 labeled entity pairs with schema types primarily Person and Organization. Validation evaluates the documented binary judgement labels (positive and negative) across the benchmark, counting and reporting any missing or unknown labels.
+- The selected OpenSanctions Pairs snapshot contains 755,540 labeled entity pairs spanning several entity schema types (including Person, Organization, LegalEntity, Company, and relationship-oriented schemas). Validation evaluates the documented binary judgement labels (positive and negative) across all pairs without treating relationship schemas as automatically propagated or excluding them without reliable supporting evidence. Unknown or missing labels are counted and reported separately.
 - Upstream docs say the old flat snapshot is no longer updated; use it only because it is a fixed, directly downloadable benchmark for reproducible validation. Do not present it as the current sanctions list.
 
 ### 2. Current official target list — OFAC SDN Enhanced XML
@@ -50,7 +50,7 @@ Record the source URL and title with every retrieved chunk. Do not invent legal 
 - Process every line in the full compressed benchmark using streaming; do not load the full decompressed file into memory.
 - Confirm readable gzip/JSONL, total rows, unique labels, row counts by label, schema pairs, source fields, missingness, malformed rows, and duplicates.
 - Expected snapshot-level checks: 755,540 rows; labels positive and negative; about 76.9% positive overall. Verify actual counts and report differences rather than forcing expected numbers.
-- Identify and audit entity schemas (primarily Person and Organization) and schema-pair distributions. Measure missingness of business and personal identifiers (e.g. taxNumber, registrationNumber, passportNumber) on both entities and the pair, explicitly excluding internal entity IDs.
+- Identify and audit entity schemas (including Person, Organization, LegalEntity, Company, and relationship-oriented schemas) and schema-pair label distributions. Measure missingness of business and personal identifiers (e.g. taxNumber, registrationNumber, passportNumber) on both entities and the pair, explicitly excluding internal entity IDs. Investigate duplicate pair keys, checking for conflicting labels and comparing canonicalized entity payloads.
 - Inspect a few rows only to validate parser behavior; this is a parser smoke test, not the model evaluation dataset.
 - Keep raw data in ignored data/; do not commit data or generated row-level names.
 

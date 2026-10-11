@@ -14,7 +14,7 @@
 2. **Official OFAC SDN list** — current reference list for a small application smoke test. [Official download page](https://sanctionslist.ofac.treas.gov/Home/SdnList) | [Direct Enhanced ZIP](https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN_ENHANCED.ZIP).
 3. **Official OFAC guidance** — [FAQ #5 on assessing possible matches](https://ofac.treasury.gov/faqs/5), [FAQ #122 on weak aliases](https://ofac.treasury.gov/faqs/122), [FAQ #246 on how list search works](https://ofac.treasury.gov/faqs/246), and [A Framework for OFAC Compliance Commitments](https://ofac.treasury.gov/system/files/126/framework_ofac_cc.pdf). These sources form the small retrieval corpus for testing source-grounded answers.
 
-The OpenSanctions Pairs snapshot is a labeled matching benchmark (755,540 pairs primarily covering Person and Organization entity schemas with positive and negative judgements), not a current sanctions list. The current OFAC list is a reference source, not a labeled customer benchmark. Validation measures baseline and model matching quality against the documented binary judgement labels without unsupported subset assumptions.
+The OpenSanctions Pairs snapshot is a labeled matching benchmark (755,540 pairs across multiple entity schema types, including Person, Organization, LegalEntity, Company, and relationship-oriented schemas with positive and negative judgements), not a current sanctions list. The current OFAC list is a reference source, not a labeled customer benchmark. Validation measures baseline and model matching quality against all documented binary judgement labels without treating relationship schemas as automatically propagated or excluding them without reliable supporting evidence.
 
 ## Data handling
 

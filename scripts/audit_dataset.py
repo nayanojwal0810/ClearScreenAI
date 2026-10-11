@@ -6,11 +6,14 @@ bounded memory and streaming processing.
 
 Key design & privacy principles:
 - Fully bounded RAM usage: uses streaming I/O and temporary disk-backed SQLite for
-  pair-deduplication indexing. Temporary files are always cleaned up on exit.
+  pair-deduplication indexing and duplicate diagnostics. Temporary files are always
+  cleaned up on exit or error.
+- Cryptographic payload hashing: evaluates identical vs different entity payloads in
+  repeated pair keys using hashes of canonicalized entity dictionaries.
 - Identifier missingness: measures true entity properties (e.g. taxNumber, passportNumber,
   registrationNumber), explicitly excluding internal entity IDs.
-- Primary evaluation target: reports all valid positive and negative judgement labels.
-  Unknown, malformed, or missing labels are counted and reported separately.
+- Primary evaluation target: reports all valid positive and negative judgement labels,
+  as well as label breakdowns across schema pairs.
 - Aggregate only: NEVER prints or persists raw entity names, birth dates, addresses,
   aliases, IDs, or raw JSON lines.
 """
@@ -90,8 +93,40 @@ def stream_jsonl(filepath: str) -> Iterator[Tuple[int, Optional[Dict[str, Any]],
                 yield (line_num, None, "json_decode_error")
 
 
+def hash_entity_payload(entity: Optional[Dict[str, Any]]) -> bytes:
+    """Computes a 16-byte cryptographic hash of a canonicalized entity payload.
+    
+    Ensures that identical entity contents produce identical hashes regardless
+    of key ordering.
+    """
+    if not isinstance(entity, dict):
+        return b""
+    canon = json.dumps(entity, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).digest()[:16]
+
+
+def canonical_pair_payload_hash(
+    lid: str,
+    rid: str,
+    left_entity: Optional[Dict[str, Any]],
+    right_entity: Optional[Dict[str, Any]],
+) -> bytes:
+    """Computes a 16-byte cryptographic hash of an unordered pair payload.
+    
+    Canonicalizes based on sorted entity IDs so (left=A, right=B) produces the same
+    payload hash as (left=B, right=A) if the entity contents are identical.
+    """
+    h_left = hash_entity_payload(left_entity)
+    h_right = hash_entity_payload(right_entity)
+    if lid <= rid:
+        combined = h_left + h_right
+    else:
+        combined = h_right + h_left
+    return hashlib.sha256(combined).digest()[:16]
+
+
 def extract_entity_info(row: Dict[str, Any], side: str) -> Dict[str, Any]:
-    """Extracts entity schema, id, caption, and properties for 'left' or 'right'.
+    """Extracts entity schema, id, caption, properties, and raw dict for 'left' or 'right'.
     
     Crucial: has_identifier measures ONLY business/personal identifier fields in properties.
     The internal record ID (entity.id) is explicitly not counted as an identifying attribute.
@@ -108,6 +143,7 @@ def extract_entity_info(row: Dict[str, Any], side: str) -> Dict[str, Any]:
             "has_caption": False,
             "has_properties": False,
             "has_identifier": False,
+            "raw_entity": None,
         }
     
     ent_id = entity.get("id")
@@ -125,7 +161,6 @@ def extract_entity_info(row: Dict[str, Any], side: str) -> Dict[str, Any]:
         for field in IDENTIFIER_PROPERTY_FIELDS:
             val = properties.get(field)
             if val:
-                # Can be a list or a string
                 if isinstance(val, list) and any(str(v).strip() for v in val):
                     has_identifier = True
                     break
@@ -139,6 +174,7 @@ def extract_entity_info(row: Dict[str, Any], side: str) -> Dict[str, Any]:
         "has_caption": has_caption,
         "has_properties": has_props,
         "has_identifier": has_identifier,
+        "raw_entity": entity,
     }
 
 
@@ -210,7 +246,8 @@ def run_audit(
     """Executes the streaming dataset audit with bounded memory and temporary disk-backed SQLite.
     
     Guarantees:
-    - Bounded RAM usage: pair deduplication indices are stored in a temporary SQLite database.
+    - Bounded RAM usage: pair records and cryptographic payload hashes are stored
+      in a temporary disk-backed SQLite database.
     - Temporary SQLite resources are guaranteed to be cleaned up on exit or error.
     - Zero raw entity names, birth dates, addresses, IDs, or lines are stored or output.
     """
@@ -229,17 +266,17 @@ def run_audit(
     left_schema_counts: Dict[str, int] = {}
     right_schema_counts: Dict[str, int] = {}
     schema_pair_counts: Dict[str, int] = {}
+    schema_pair_label_counts: Dict[str, Dict[str, int]] = {}
     
     missing_captions = {"left": 0, "right": 0, "both": 0, "any": 0}
     empty_properties = {"left": 0, "right": 0, "both": 0, "any": 0}
     missing_identifiers = {"left": 0, "right": 0, "both": 0, "any": 0}
     
-    duplicate_pair_rows = 0
     rows_missing_ids = 0
 
-    # Temporary disk-backed SQLite database for deduplication index
+    # Temporary disk-backed SQLite database for duplicate pair diagnostics
     temp_dir = tempfile.mkdtemp(prefix="clearscreen_audit_")
-    db_path = os.path.join(temp_dir, "seen_pairs.db")
+    db_path = os.path.join(temp_dir, "pair_diagnostics.db")
     db_conn: Optional[sqlite3.Connection] = None
 
     try:
@@ -247,10 +284,16 @@ def run_audit(
         cur = db_conn.cursor()
         cur.execute("PRAGMA synchronous = OFF")
         cur.execute("PRAGMA journal_mode = OFF")
-        cur.execute("CREATE TABLE seen_pairs (pair_hash BLOB PRIMARY KEY)")
+        cur.execute(
+            """CREATE TABLE pair_records (
+                pair_key_hash BLOB,
+                label TEXT,
+                payload_hash BLOB
+            )"""
+        )
         db_conn.commit()
 
-        batch_pairs: List[Tuple[bytes,]] = []
+        batch_records: List[Tuple[bytes, str, bytes]] = []
         batch_size = 5000
 
         for line_num, row_data, err in stream_jsonl(pairs_path):
@@ -278,8 +321,22 @@ def run_audit(
             left_schema_counts[l_sch] = left_schema_counts.get(l_sch, 0) + 1
             right_schema_counts[r_sch] = right_schema_counts.get(r_sch, 0) + 1
             
+            # Schema pair counting and label breakdown
             sch_pair = f"{min(l_sch, r_sch)} <-> {max(l_sch, r_sch)}"
             schema_pair_counts[sch_pair] = schema_pair_counts.get(sch_pair, 0) + 1
+            
+            if sch_pair not in schema_pair_label_counts:
+                schema_pair_label_counts[sch_pair] = {
+                    "positive": 0,
+                    "negative": 0,
+                    "unknown_or_missing": 0,
+                    "total": 0,
+                }
+            schema_pair_label_counts[sch_pair]["total"] += 1
+            if lbl in ("positive", "negative"):
+                schema_pair_label_counts[sch_pair][lbl] += 1
+            else:
+                schema_pair_label_counts[sch_pair]["unknown_or_missing"] += 1
             
             # Attribute missingness: Captions
             left_no_cap = not left_info["has_caption"]
@@ -317,35 +374,84 @@ def run_audit(
             if left_no_id or right_no_id:
                 missing_identifiers["any"] += 1
                 
-            # Duplicate detection using stable pair IDs via disk-backed SQLite
+            # Record duplicate diagnostics using temporary SQLite
             lid = left_info["id"]
             rid = right_info["id"]
             if lid and rid:
-                pair_key = f"{min(lid, rid)}::{max(lid, rid)}".encode("utf-8")
-                h = hashlib.blake2b(pair_key, digest_size=16).digest()
-                batch_pairs.append((h,))
-                if len(batch_pairs) >= batch_size:
-                    cur.executemany("INSERT OR IGNORE INTO seen_pairs VALUES (?)", batch_pairs)
-                    # Count duplicates in this batch
-                    # rows actually inserted vs attempted
-                    inserted = cur.rowcount
-                    # In SQLite executemany, total inserted can be checked via changes() or count
-                    batch_pairs.clear()
+                pair_key_bytes = f"{min(lid, rid)}::{max(lid, rid)}".encode("utf-8")
+                pair_key_h = hashlib.blake2b(pair_key_bytes, digest_size=16).digest()
+                payload_h = canonical_pair_payload_hash(
+                    lid, rid, left_info["raw_entity"], right_info["raw_entity"]
+                )
+                batch_records.append((pair_key_h, lbl, payload_h))
+                if len(batch_records) >= batch_size:
+                    cur.executemany("INSERT INTO pair_records VALUES (?, ?, ?)", batch_records)
+                    batch_records.clear()
             else:
                 rows_missing_ids += 1
 
-        # Process any remaining batch items
-        if batch_pairs:
-            cur.executemany("INSERT OR IGNORE INTO seen_pairs VALUES (?)", batch_pairs)
-            batch_pairs.clear()
+        if batch_records:
+            cur.executemany("INSERT INTO pair_records VALUES (?, ?, ?)", batch_records)
+            batch_records.clear()
 
+        # Index pair_key_hash for diagnostic query performance
+        cur.execute("CREATE INDEX idx_pair_key_hash ON pair_records(pair_key_hash)")
         db_conn.commit()
 
-        # Compute duplicate count from total attempted with IDs minus unique in DB
-        cur.execute("SELECT count(*) FROM seen_pairs")
-        unique_pairs_count = cur.fetchone()[0]
+        # 1. Total rows with IDs & unique unordered entity-pair keys
         total_with_ids = total_parsed_rows - rows_missing_ids
-        duplicate_pair_rows = total_with_ids - unique_pairs_count
+        cur.execute("SELECT count(DISTINCT pair_key_hash) FROM pair_records")
+        unique_pair_keys = cur.fetchone()[0]
+
+        # 2. Number of repeated pair keys and duplicate rows
+        cur.execute(
+            """SELECT count(*) FROM (
+                SELECT pair_key_hash FROM pair_records
+                GROUP BY pair_key_hash
+                HAVING count(*) > 1
+            )"""
+        )
+        repeated_pair_keys = cur.fetchone()[0]
+        duplicate_rows = total_with_ids - unique_pair_keys
+
+        # 3 & 4. Conflicting label pair keys and rows
+        cur.execute(
+            """SELECT
+                count(*),
+                coalesce(sum(cnt), 0)
+            FROM (
+                SELECT pair_key_hash, count(*) as cnt
+                FROM pair_records
+                GROUP BY pair_key_hash
+                HAVING count(DISTINCT CASE WHEN label IN ('positive', 'negative') THEN label END) > 1
+            )"""
+        )
+        conflicting_res = cur.fetchone()
+        conflicting_keys_count = conflicting_res[0] if conflicting_res else 0
+        conflicting_rows_count = conflicting_res[1] if conflicting_res else 0
+
+        # 5. Number of repeated pairs with identical versus different entity payloads
+        cur.execute(
+            """SELECT
+                coalesce(sum(CASE WHEN distinct_payloads = 1 THEN 1 ELSE 0 END), 0) as identical_keys,
+                coalesce(sum(CASE WHEN distinct_payloads > 1 THEN 1 ELSE 0 END), 0) as different_keys,
+                coalesce(sum(CASE WHEN distinct_payloads = 1 THEN row_cnt ELSE 0 END), 0) as identical_rows,
+                coalesce(sum(CASE WHEN distinct_payloads > 1 THEN row_cnt ELSE 0 END), 0) as different_rows
+            FROM (
+                SELECT
+                    pair_key_hash,
+                    count(*) as row_cnt,
+                    count(DISTINCT payload_hash) as distinct_payloads
+                FROM pair_records
+                GROUP BY pair_key_hash
+                HAVING count(*) > 1
+            )"""
+        )
+        payload_diag = cur.fetchone()
+        identical_payload_keys = payload_diag[0] if payload_diag else 0
+        different_payload_keys = payload_diag[1] if payload_diag else 0
+        identical_payload_rows = payload_diag[2] if payload_diag else 0
+        different_payload_rows = payload_diag[3] if payload_diag else 0
 
     finally:
         # Guarantee cleanup of temporary database and directory
@@ -395,6 +501,23 @@ def run_audit(
             f"Encountered {unknown_or_missing_rows} rows with unknown or missing labels."
         )
 
+    duplicate_analysis = {
+        "total_rows_with_pair_ids": total_with_ids,
+        "unique_unordered_pair_keys": unique_pair_keys,
+        "repeated_pair_keys": repeated_pair_keys,
+        "duplicate_rows": duplicate_rows,
+        "conflicting_label_pair_keys": conflicting_keys_count,
+        "conflicting_label_rows": conflicting_rows_count,
+        "repeated_pairs_identical_payload": identical_payload_keys,
+        "repeated_pairs_different_payload": different_payload_keys,
+        "repeated_rows_identical_payload": identical_payload_rows,
+        "repeated_rows_different_payload": different_payload_rows,
+        "note": (
+            "Cryptographic hashes of canonicalized entity payloads were used for duplicate-content "
+            "diagnostics. No raw entity content or identifiers are persisted."
+        ),
+    }
+
     summary: Dict[str, Any] = {
         "metadata": {
             "pairs_file": pairs_path,
@@ -419,7 +542,9 @@ def run_audit(
             "left_schema_counts": left_schema_counts,
             "right_schema_counts": right_schema_counts,
             "schema_pair_counts": schema_pair_counts,
+            "schema_pair_label_counts": schema_pair_label_counts,
         },
+        "duplicate_pair_analysis": duplicate_analysis,
         "data_quality": {
             "missing_captions": missing_captions,
             "empty_properties": empty_properties,
@@ -428,9 +553,10 @@ def run_audit(
                 "note": "Evaluated against business/personal identifier fields; entity.id explicitly excluded.",
                 "identifier_fields_checked": sorted(list(IDENTIFIER_PROPERTY_FIELDS)),
             },
-            "duplicate_pair_rows": duplicate_pair_rows,
-            "unique_pair_ids_seen": unique_pairs_count,
+            "duplicate_pair_rows": duplicate_rows,
+            "unique_pair_ids_seen": unique_pair_keys,
             "rows_missing_ids": rows_missing_ids,
+            "duplicate_pair_analysis": duplicate_analysis,
         },
         "expected_vs_observed_checks": expected_checks,
     }
@@ -493,8 +619,15 @@ def main() -> None:
     print(f"Valid labeled rows: {summary['row_counts']['valid_labeled_rows']:,}")
     print(f"Unknown/missing labels: {summary['row_counts']['unknown_or_missing_label_rows']:,}")
     print(f"Labels: {summary['labels']['counts']}")
-    print(f"Unique pair IDs: {summary['data_quality']['unique_pair_ids_seen']:,}")
-    print(f"Duplicate pair rows: {summary['data_quality']['duplicate_pair_rows']:,}")
+    
+    dup_info = summary["duplicate_pair_analysis"]
+    print(f"Unique pair keys: {dup_info['unique_unordered_pair_keys']:,}")
+    print(f"Repeated pair keys: {dup_info['repeated_pair_keys']:,}")
+    print(f"Duplicate rows: {dup_info['duplicate_rows']:,}")
+    print(f"Conflicting-label pair keys: {dup_info['conflicting_label_pair_keys']:,} ({dup_info['conflicting_label_rows']:,} rows)")
+    print(f"Repeated pairs with identical payload: {dup_info['repeated_pairs_identical_payload']:,} keys ({dup_info['repeated_rows_identical_payload']:,} rows)")
+    print(f"Repeated pairs with different payload: {dup_info['repeated_pairs_different_payload']:,} keys ({dup_info['repeated_rows_different_payload']:,} rows)")
+    
     if summary.get("ofac_sdn_archive"):
         print(f"OFAC SDN archive: {summary['ofac_sdn_archive'].get('status')}")
     warnings = summary["expected_vs_observed_checks"]["warnings"]
