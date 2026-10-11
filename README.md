@@ -1,35 +1,28 @@
 # ClearScreenAI
 
-**Evidence-grounded sanctions screening research prototype** — a student project exploring entity-name matching, analyst review, and retrieval-grounded compliance assistance.
+**Evidence-grounded sanctions screening and investigation copilot** — a student portfolio project combining entity matching, Deep Learning, retrieval-grounded GenAI, and a human-review workflow.
 
-> **Important:** This is an educational prototype, not a sanctions compliance product. It must not be used to approve, reject, block, or clear real customers or transactions. A possible match is not a determination that a person is sanctioned. Human review and authoritative official sources are required.
+> **Safety boundary:** This is an educational prototype, not a sanctions compliance product. It must not automatically approve, reject, block, or clear customers or transactions. A possible match is not proof that a person or organization is sanctioned. Final review belongs to qualified humans using authoritative sources.
 
 ## Current phase
 
-**Phase 0 — data acquisition and signal-only validation planning.** The repository is intentionally kept small. The first check will compare simple name-matching baselines on a controlled test set generated from official sanctions-list records. We will not claim model performance until experiments actually run.
+**Signal-only validation planning.** No experiments have been run and no performance claims are available. See [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for source decisions, licensing, evaluation gates, resource limits, and the go/no-go criteria.
 
-## Dataset
+## Data sources
 
-- Primary source: [OFAC Sanctions List Service — SDN List](https://sanctionslist.ofac.treas.gov/Home/SdnList)
-- Direct enhanced XML download (compressed): [SDN_ENHANCED.ZIP](https://sanctionslist.ofac.treas.gov/Home/SdnList?leng=eng)
-- OFAC explains its data formats and the distinction between strong and weak aliases in its [official FAQ](https://ofac.treasury.gov/faqs/122).
-- Dataset page and download layout can change. Prefer the official download page if the direct link does not start a download.
+1. **OpenSanctions Pairs** — labeled entity pairs for matching-model evaluation, snapshot dated 2025-12-09. [Direct download](https://huggingface.co/datasets/sanctions-er-anon/opensanctions_pairs/resolve/main/pairs.json.gz?download=true) (~409 MB compressed; 755,540 pairs). Upstream docs: [OpenSanctions matcher training data](https://www.opensanctions.org/docs/opensource/pairs/). The source marks this dataset as non-commercial; cite OpenSanctions and review the license before use beyond a non-commercial portfolio.
+2. **Official OFAC SDN list** — current reference list for a small application smoke test. [Official download page](https://sanctionslist.ofac.treas.gov/Home/SdnList) | [Direct Enhanced ZIP](https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN_ENHANCED.ZIP).
+3. **Official OFAC guidance** — [FAQ #5 on assessing possible matches](https://ofac.treasury.gov/faqs/5), [FAQ #122 on weak aliases](https://ofac.treasury.gov/faqs/122), [FAQ #246 on how list search works](https://ofac.treasury.gov/faqs/246), and [A Framework for OFAC Compliance Commitments](https://ofac.treasury.gov/system/files/126/framework_ofac_cc.pdf). These sources form the small retrieval corpus for testing source-grounded answers.
 
-The official list is a list of sanctioned targets and aliases; it is **not** a ready-made labeled customer screening benchmark. Validation queries and non-matches must be generated separately and documented as synthetic.
-
-## Planned validation (not yet executed)
-
-1. Confirm the downloaded archive and file format.
-2. Parse records and aliases locally; report counts, missing fields, and parsing errors.
-3. Create deterministic synthetic screening queries from a fixed seed, with positive variants and difficult non-match names; keep entity-level train/test separation to avoid leakage.
-4. Compare exact matching and character-similarity/fuzzy matching against a small pretrained transformer-based reranker only if label construction and runtime justify it.
-5. Report precision, recall, F1, precision-recall AUC where meaningful, recall at a fixed review volume, and examples of false positives/false negatives. Do not treat synthetic performance as real-world compliance accuracy.
-6. Separately test retrieval against official compliance guidance, measuring retrieval relevance and whether answers cite retrieved passages. No LLM-based component is assumed to pass merely because it produces fluent text.
+The OpenSanctions Pairs snapshot is a labeled matching benchmark, not a current sanctions list. The current OFAC list is a reference source, not a labeled customer benchmark. The published benchmark also includes automatically propagated positive relation pairs; validation will report analyst-judged identity pairs separately so headline performance is not inflated.
 
 ## Data handling
 
-Do not commit downloaded sanctions lists, generated datasets containing personal names, model weights, API keys, or other large/generated files. Keep local data under ignored `data/` directories. Commit code, configuration, tests, and aggregate evaluation results only after reviewing them.
+Raw data belongs only in ignored local folders such as `data/raw/`. Do not commit downloaded data, raw entity records, generated record-level names, model weights, embeddings, API keys, or row-level predictions. Commit code, tests, source citations, and reviewed aggregate metrics only.
 
 ## Status
 
-No validation has been run yet. No metrics or performance claims are available.
+- Repository initialized with README and .gitignore.
+- Signal-only validation plan committed.
+- Dataset has not been run through any parser or model.
+- No performance metrics have been measured.
